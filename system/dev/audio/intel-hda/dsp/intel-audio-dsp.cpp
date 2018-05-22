@@ -68,6 +68,9 @@ zx_status_t IntelAudioDsp::DriverBind(zx_device_t* hda_dev) {
 
     state_ = State::INITIALIZING;
 
+    // Start IPC thread
+    ipc_.StartWorkThread();
+
     // Perform hardware initializastion in a thread.
     int c11_res = thrd_create(
             &init_thread_,
@@ -229,15 +232,17 @@ zx_status_t IntelAudioDsp::ParseNhlt() {
 }
 
 void IntelAudioDsp::DeviceShutdown() {
-    if (state_ == State::INITIALIZING) {
-        thrd_join(init_thread_, NULL);
-    }
-
     PowerDownCore(ADSP_REG_ADSPCS_CORE0_MASK);
 
     // Disable Audio DSP and interrupt
     ihda_dsp_irq_disable(&ihda_dsp_);
     ihda_dsp_disable(&ihda_dsp_);
+
+    if (state_ == State::INITIALIZING) {
+        thrd_join(init_thread_, NULL);
+    }
+
+    ipc_.StopWorkThread();
 
     state_ = State::SHUT_DOWN;
 }

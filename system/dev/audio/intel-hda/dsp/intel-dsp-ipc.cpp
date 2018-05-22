@@ -15,6 +15,11 @@
 namespace audio {
 namespace intel_hda {
 
+namespace {
+constexpr zx_signals_t IPC_RECEIVED = ZX_EVENT_SIGNALED;
+constexpr zx_signals_t IPC_SHUTDOWN = ZX_USER_SIGNAL_0;
+}  // anon namespace
+
 IntelDspIpc::IntelDspIpc(IntelAudioDsp& dsp) : dsp_(dsp) {
     snprintf(log_prefix_, sizeof(log_prefix_), "IHDA DSP IPC (unknown BDF)");
 }
@@ -23,32 +28,96 @@ void IntelDspIpc::SetLogPrefix(const char* new_prefix) {
     snprintf(log_prefix_, sizeof(log_prefix_), "%s IPC", new_prefix);
 }
 
-zx_status_t IntelDspIpc::SendIpc(Txn* txn) {
-    {
-        fbl::AutoLock ipc_lock(&ipc_lock_);
-        // 1 at a time
-        ZX_DEBUG_ASSERT(pending_txn_ == nullptr);
-        if (pending_txn_ != nullptr) {
-            return ZX_ERR_BAD_STATE;
-        }
-        pending_txn_ = txn;
+zx_status_t IntelDspIpc::StartWorkThread() {
+    zx_status_t res = zx::event::create(0u, &work_event_);
+    if (res != ZX_OK) {
+        LOG(ERROR, "Failed to create event (res %d)\n", res);
+        return res;
     }
 
-    // Copy tx data to outbox
-    if (txn->tx_size > 0) {
-        dsp_.IpcMailboxWrite(txn->tx_data, txn->tx_size);
+    int c11_res = thrd_create(&work_thread_,
+                              [](void* ctx) -> int {
+                                  return static_cast<IntelDspIpc*>(ctx)->WorkThread();
+                              },
+                              this);
+    if (c11_res < 0) {
+        LOG(ERROR, "Failed to create work thread (res = %d)\n", c11_res);
+        return ZX_ERR_INTERNAL;
+    } else {
+        return ZX_OK;
     }
-    dsp_.SendIpcMessage(txn->request);
-    return ZX_OK;
+}
+
+void IntelDspIpc::StopWorkThread() {
+    if (!work_event_.is_valid()) {
+        return;
+    }
+
+    work_event_.signal(0u, IPC_SHUTDOWN);
+    thrd_join(work_thread_, NULL);
+
+    work_event_.reset();
+
+    {
+        fbl::AutoLock ipc_lock(&ipc_lock_);
+        // Fail all pending IPCs
+        for (auto iter = ipc_queue_.begin(); iter != ipc_queue_.end(); iter++) {
+            completion_signal(&iter->completion);
+        }
+        if (pending_txn_) {
+            ZX_DEBUG_ASSERT(!pending_txn_->done);
+            completion_signal(&pending_txn_->completion);
+        }
+    }
+}
+
+int IntelDspIpc::WorkThread() {
+    for (;;) {
+        zx_signals_t pending;
+        zx_status_t res = work_event_.wait_one(IPC_RECEIVED | IPC_SHUTDOWN,
+                                              zx::time::infinite(),
+                                              &pending);
+        if (res != ZX_OK) {
+            LOG(ERROR, "Failed to wait for event (res %d)\n", res);
+            return -1;
+        }
+        work_event_.signal(pending, 0u);
+        if (pending & IPC_SHUTDOWN) {
+            LOG(TRACE, "Work thread exiting\n");
+            return 0;
+        }
+        if (pending & IPC_RECEIVED) {
+            Txn* txn = nullptr;
+            {
+                fbl::AutoLock ipc_lock(&ipc_lock_);
+                txn = ipc_queue_.pop_front();
+                if (txn == nullptr) {
+                    LOG(TRACE, "No new txn\n");
+                    continue;
+                }
+                ZX_DEBUG_ASSERT(pending_txn_ == nullptr);
+                pending_txn_ = txn;
+            }
+            // Copy tx data to outbox
+            if (txn->tx_size > 0) {
+                dsp_.IpcMailboxWrite(txn->tx_data, txn->tx_size);
+            }
+            dsp_.SendIpcMessage(txn->request);
+        }
+    }
+    return 0;
 }
 
 zx_status_t IntelDspIpc::SendIpcWait(Txn* txn) {
-    zx_status_t res = SendIpc(txn);
-    if (res != ZX_OK) {
-        return res;
+    // Add to the pending queue and signal the work thread
+    {
+        fbl::AutoLock ipc_lock(&ipc_lock_);
+        ipc_queue_.push_back(txn);
     }
+    work_event_.signal(0u, IPC_RECEIVED);
+
     // Wait for completion
-    res = completion_wait(&txn->completion, ZX_MSEC(300));
+    zx_status_t res = completion_wait(&txn->completion, ZX_MSEC(300));
     if (res != ZX_OK) {
         dsp_.DeviceShutdown();
     }
@@ -225,10 +294,11 @@ void IntelDspIpc::ProcessIpcReply(const IpcMessage& reply) {
         return;
     }
 
+    pending_txn_->reply = reply;
+    pending_txn_->done = true;
+
     LOG(INFO, "got reply (status %u) for pending msg, pri 0x%08x ext 0x%08x\n",
               to_underlying(reply.status()), reply.primary, reply.extension);
-
-    pending_txn_->reply = reply;
 
     if (reply.msg_tgt() == MsgTarget::MODULE_MSG) {
         ModuleMsgType type = static_cast<ModuleMsgType>(reply.type());
